@@ -32,9 +32,9 @@ cl /nologo /utf-8 /std:c++17 /EHsc /O2 /MD /W3 /bigobj /openmp ^
   third_party\imgui\imgui_widgets.cpp ^
   third_party\imgui\backends\imgui_impl_glfw.cpp ^
   third_party\imgui\backends\imgui_impl_opengl3.cpp ^
-  /Fobin\ /Fe:bin\ComplexGeom.exe ^
+  /Fobin\ /Fe:bin\Complex-Geom.exe ^
   /link /LIBPATH:third_party\glfw\lib-vc2022 glfw3.lib opengl32.lib user32.lib gdi32.lib shell32.lib winmm.lib
 
 if errorlevel 1 exit /b 1
-echo Built bin\ComplexGeom.exe
+echo Built bin\Complex-Geom.exe
 endlocal
