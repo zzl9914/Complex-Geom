@@ -11,6 +11,7 @@
 
 #include <ctype.h>
 #include <float.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -290,10 +291,21 @@ static int sc_failed(void) { return sc_peek_error() != SC_OK; }
 sc_complex sc_pow_int(sc_complex base, int exponent, double system) {
     if (exponent == 0) return sc_one();
     if (sc_is_zero(base)) return sc_zero();
-    if (exponent < 0) return sc_div(sc_one(), sc_pow_int(base, -exponent, system), system);
-    if (exponent % 2) return sc_mul(base, sc_pow_int(base, exponent - 1, system), system);
-    sc_complex half = sc_pow_int(base, exponent / 2, system);
-    return sc_mul(half, half, system);
+    /* Iterative. Negating INT_MIN does not change the value, so the old
+       recursive `1 / pow(base, -exponent)` never returned. */
+    int neg = exponent < 0;
+    unsigned uexp = neg
+        ? (exponent == INT_MIN ? 2147483648u : (unsigned)(-exponent))
+        : (unsigned)exponent;
+    sc_complex result = sc_one();
+    sc_complex factor = base;
+    while (uexp) {
+        if (uexp & 1u) result = sc_mul(result, factor, system);
+        uexp >>= 1;
+        if (uexp) factor = sc_mul(factor, factor, system);
+    }
+    if (neg) return sc_div(sc_one(), result, system);
+    return result;
 }
 
 static sc_complex sc_sqrt_init(sc_complex a, sc_complex b, double system, int max_iterations) {
@@ -498,7 +510,8 @@ sc_complex sc_csch(sc_complex a, double system) { return sc_div(sc_one(), sc_sin
 sc_complex sc_pow(sc_complex base, sc_complex exponent, double system) {
     if (sc_is_zero(exponent)) return sc_one();
     if (sc_is_zero(base)) return sc_zero();
-    if (exponent.imag == 0.0 && exponent.real == round(exponent.real))
+    if (exponent.imag == 0.0 && exponent.real == round(exponent.real) &&
+        exponent.real >= (double)INT_MIN && exponent.real <= (double)INT_MAX)
         return sc_pow_int(base, (int)exponent.real, system);
     return sc_exp(sc_mul(sc_log(base, system), exponent, system), system);
 }

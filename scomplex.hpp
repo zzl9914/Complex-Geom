@@ -1183,10 +1183,24 @@ template<typename _Tp>inline constexpr complex<_Tp> abs(complex<_Tp> a)noexcept{
 template<typename _Tp>complex<_Tp> pow(complex<_Tp> base,int exponent){
     if(!exponent)return 1;
     if(!base)return 0;
-    if(exponent<0)return 1/pow(base,-exponent);
-    if(exponent%2)return base*pow(base,exponent-1);
-    complex<_Tp> ans=pow(base,exponent/2);
-    return ans*ans;
+    // Iterative binary exponentiation. The old recursion did
+    // pow(base, -exponent) first; negating INT_MIN does not change the
+    // value, so that path never returned.
+    bool neg=exponent<0;
+    unsigned uexp;
+    if(neg){
+        uexp=exponent==std::numeric_limits<int>::min()
+            ? 2147483648u
+            : static_cast<unsigned>(-exponent);
+    }else uexp=static_cast<unsigned>(exponent);
+    complex<_Tp> result(1),factor=base;
+    while(uexp){
+        if(uexp&1u)result*=factor;
+        uexp>>=1;
+        if(uexp)factor*=factor;
+    }
+    if(neg)return complex<_Tp>(1)/result;
+    return result;
 }
 
 /**
@@ -1612,8 +1626,17 @@ template<typename _Tp>complex<_Tp> hyper_xexp(complex<_Tp> a,int n){
 template<typename _Tp>complex<_Tp> pow(complex<_Tp> base,complex<_Tp> exponent){
     if(!exponent)return 1;
     if(!base)return 0;
-    if(real(exponent)==std::round(real(exponent))&&(!imag(exponent)))
-        return pow(base,int(real(exponent)));
+    // Both call sites arrive here. A real integer exponent then diverts to
+    // the integer overload; any nonzero imag, or a non-integer real, stays
+    // on exp(log). Out-of-range integers must not be cast to int: on MSVC
+    // that cast becomes INT_MIN and the old integer pow recursed forever.
+    if(!imag(exponent)){
+        _Tp r=real(exponent);
+        _Tp n=std::round(r);
+        constexpr _Tp lo=static_cast<_Tp>(std::numeric_limits<int>::min());
+        constexpr _Tp hi=static_cast<_Tp>(std::numeric_limits<int>::max());
+        if(r==n&&n>=lo&&n<=hi)return pow(base,static_cast<int>(n));
+    }
     return exp(log(base)*exponent);
 }
 

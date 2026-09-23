@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 #ifdef _OPENMP
@@ -314,12 +315,105 @@ static int gpu_fn_id() {
     return -1;
 }
 
+static std::string fractal_shader_source(const CompiledExpr& e, bool dbl) {
+    std::string body = glsl_formula(e, dbl);
+    if (body.empty()) return {};
+    std::ostringstream o;
+    o << "#version 400\nout vec4 frag;\n";
+    if (dbl) {
+        o << "uniform dvec2 u_center;\nuniform double u_scale;\n";
+        o << "uniform dvec2 u_seed;\n";
+    } else {
+        o << "uniform vec2 u_center;\nuniform float u_scale;\n";
+        o << "uniform vec2 u_seed;\n";
+    }
+    o << "uniform vec2 u_resolution;\nuniform int u_family;\nuniform int u_L;\n";
+    o << "uniform int u_max_iter;\nuniform int u_julia;\n";
+    o << body;
+    if (dbl) {
+        o << R"(
+void main(){
+    double m = double(min(u_resolution.x, u_resolution.y));
+    dvec2 pix = dvec2(
+        u_center.x + u_scale * (double(gl_FragCoord.x) - double(u_resolution.x)*0.5) / m,
+        u_center.y + u_scale * (double(gl_FragCoord.y) - double(u_resolution.y)*0.5) / m);
+    dvec2 c = (u_julia != 0) ? u_seed : pix;
+    dvec2 z = (u_julia != 0) ? pix : dvec2(0.0);
+    int i;
+    double mag = 0.0;
+    for(i=0;i<u_max_iter;++i){
+        if(u_family==1) z = dvec2(z.x, -z.y);
+        if(u_family==2) z = dvec2(abs(z.x), abs(z.y));
+        dvec2 f = cf_f(z, c);
+)";
+    } else {
+        o << R"(
+void main(){
+    float m = min(u_resolution.x, u_resolution.y);
+    vec2 pix = vec2(
+        u_center.x + u_scale * (gl_FragCoord.x - u_resolution.x*0.5) / m,
+        u_center.y + u_scale * (gl_FragCoord.y - u_resolution.y*0.5) / m);
+    vec2 c = (u_julia != 0) ? u_seed : pix;
+    vec2 z = (u_julia != 0) ? pix : vec2(0.0);
+    int i;
+    float mag = 0.0;
+    for(i=0;i<u_max_iter;++i){
+        if(u_family==1) z = vec2(z.x, -z.y);
+        if(u_family==2) z = vec2(abs(z.x), abs(z.y));
+        vec2 f = cf_f(z, c);
+)";
+    }
+    if (e.uses_c)
+        o << "        z = f;\n";
+    else
+        o << "        z = (u_L != 0) ? (z - f + c) : (f + c);\n";
+    o << R"(
+        mag = z.x*z.x + z.y*z.y;
+        if(!(mag <= 256.0)) break;
+    }
+    if(i>=u_max_iter){ frag = vec4(0.02,0.02,0.05,1); return; }
+    float nu = float(i) + 1.0 - log(log(float(mag))*0.5)/log(2.0);
+    float t = nu / float(max(u_max_iter,1));
+    vec3 col = vec3(0.5+0.5*cos(0.15*nu+0.0), 0.5+0.5*cos(0.15*nu+2.1), 0.5+0.5*cos(0.15*nu+4.2));
+    frag = vec4(col*(0.35+0.65*t), 1.0);
+}
+)";
+    return o.str();
+}
+
+static std::string g_gpu_expr;
+static bool g_gpu_ok = false;
+
 static bool fractal_use_gpu() {
     if (g.system != -1.0) return false;
-    std::string e = g.expr;
-    if (e == "z^2" || e == "x^2") return true;
-    if (!g.L && (e == "z^2+c" || e == "x^2+c")) return true;
-    return false;
+    if (!refresh_compiled()) return false;
+    if (g_gpu_expr == g.expr) return g_gpu_ok;
+    g_gpu_expr = g.expr;
+    g_gpu_ok = false;
+    if (g_fx.root < 0 || expr_has_gamma(g_fx)) return false;
+    bool want_dbl = glUniform2d && glUniform1d;
+    GLuint prog = 0;
+    bool used_dbl = false;
+    if (want_dbl) {
+        std::string src = fractal_shader_source(g_fx, true);
+        if (!src.empty()) prog = link_program(kVSQuad, src.c_str());
+        used_dbl = prog != 0;
+    }
+    if (!prog) {
+        std::string src = fractal_shader_source(g_fx, false);
+        if (!src.empty()) prog = link_program(kVSQuad, src.c_str());
+        used_dbl = false;
+    }
+    if (!prog) {
+        g.status = "GPU shader failed; this formula is on the CPU.";
+        return false;
+    }
+    if (g.prog_fractal) glDeleteProgram(g.prog_fractal);
+    g.prog_fractal = prog;
+    g.fractal_double = used_dbl;
+    g_gpu_ok = true;
+    if (g.status == "GPU shader failed; this formula is on the CPU.") g.status.clear();
+    return true;
 }
 
 static cx::complex<double> fractal_apply(cx::complex<double> a, cx::complex<double> c) {
@@ -558,48 +652,125 @@ static void render_domain_cpu() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data());
 }
 
+static int iterate_orbit(cx::complex<double> pix, cx::complex<double> seed, int maxit, double& mag) {
+    cx::complex<double> c = g.julia ? seed : pix;
+    cx::complex<double> z = g.julia ? pix : cx::complex<double>(0, 0);
+    int it = 0;
+    mag = 0.0;
+    try {
+        for (; it < maxit; ++it) {
+            z = fractal_apply(z, c);
+            mag = cx::norm_norm(z);
+            if (!(mag <= 256.0)) break;
+        }
+    } catch (...) {
+        it = maxit;
+        mag = 0.0;
+    }
+    return it;
+}
+
+static void paint_orbit(unsigned char* img, int w, int x, int y, int it, int maxit, float mag) {
+    size_t o = ((size_t)y * (size_t)w + (size_t)x) * 3;
+    if (it >= maxit) {
+        img[o] = 5;
+        img[o + 1] = 5;
+        img[o + 2] = 13;
+        return;
+    }
+    float nu = (float)it;
+    if (mag > 1.0f && std::isfinite(mag))
+        nu = (float)it + 1.0f - std::log(std::log(mag) * 0.5f) / std::log(2.0f);
+    float t = nu / (float)maxit;
+    float R = 0.5f + 0.5f * std::cos(0.15f * nu);
+    float Gch = 0.5f + 0.5f * std::cos(0.15f * nu + 2.1f);
+    float B = 0.5f + 0.5f * std::cos(0.15f * nu + 4.2f);
+    float s = 0.35f + 0.65f * t;
+    img[o] = (unsigned char)std::clamp(R * s * 255.0f, 0.f, 255.f);
+    img[o + 1] = (unsigned char)std::clamp(Gch * s * 255.0f, 0.f, 255.f);
+    img[o + 2] = (unsigned char)std::clamp(B * s * 255.0f, 0.f, 255.f);
+}
+
+// Mariani–Silver solid guessing: if every pixel on a rectangle's border
+// stays in the set, the interior is filled without iterating. That is the
+// quadtree skip Ultra Fractal uses on large non-escaping regions. A filament
+// or minibrot that does not touch the border of its block is painted as
+// interior too; blocks shrink until the border is mixed or the block is tiny.
 static void render_fractal_cpu() {
     if (!refresh_compiled()) return;
     int w = g.fbo_w, h = g.fbo_h;
+    if (w < 1 || h < 1) return;
     int maxit = std::max(1, g.max_iter);
-    std::vector<unsigned char> img((size_t)w * h * 3, 5);
+    std::vector<int> it((size_t)w * (size_t)h, -1);
+    std::vector<float> mag((size_t)w * (size_t)h, 0.f);
     cx::complex<double>::set_system(g.system);
     const cx::complex<double> seed(g.julia_re, g.julia_im);
+
+    const int TS = 160;
+    int nx = (w + TS - 1) / TS;
+    int ny = (h + TS - 1) / TS;
+    int ntiles = nx * ny;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 4)
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+    for (int t = 0; t < ntiles; ++t) {
+        int x0 = (t % nx) * TS;
+        int y0 = (t / nx) * TS;
+        int x1 = std::min(x0 + TS, w);
+        int y1 = std::min(y0 + TS, h);
+        auto pix_at = [&](int x, int y) -> int {
+            size_t i = (size_t)y * (size_t)w + (size_t)x;
+            if (it[i] >= 0) return it[i];
+            double m = 0.0;
+            int k = iterate_orbit(from_pixel(x + 0.5, y + 0.5, w, h), seed, maxit, m);
+            it[i] = k;
+            mag[i] = (float)m;
+            return k;
+        };
+        auto quad = [&](auto&& self, int xa, int ya, int xb, int yb) -> void {
+            if (xa >= xb || ya >= yb) return;
+            bool all = true;
+            for (int x = xa; x < xb && all; ++x) {
+                if (pix_at(x, ya) < maxit) all = false;
+                if (all && yb - 1 != ya && pix_at(x, yb - 1) < maxit) all = false;
+            }
+            for (int y = ya + 1; y < yb - 1 && all; ++y) {
+                if (pix_at(xa, y) < maxit) all = false;
+                if (all && xb - 1 != xa && pix_at(xb - 1, y) < maxit) all = false;
+            }
+            int bw = xb - xa, bh = yb - ya;
+            if (all && bw > 1 && bh > 1) {
+                for (int y = ya + 1; y < yb - 1; ++y)
+                    for (int x = xa + 1; x < xb - 1; ++x)
+                        it[(size_t)y * (size_t)w + (size_t)x] = maxit;
+                return;
+            }
+            if (bw <= 2 || bh <= 2) {
+                for (int y = ya; y < yb; ++y)
+                    for (int x = xa; x < xb; ++x)
+                        pix_at(x, y);
+                return;
+            }
+            int mx = xa + bw / 2;
+            int my = ya + bh / 2;
+            self(self, xa, ya, mx, my);
+            self(self, mx, ya, xb, my);
+            self(self, xa, my, mx, yb);
+            self(self, mx, my, xb, yb);
+        };
+        quad(quad, x0, y0, x1, y1);
+    }
+
+    std::vector<unsigned char> img((size_t)w * h * 3, 5);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
 #endif
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
-            auto pix = from_pixel(x + 0.5, y + 0.5, w, h);
-            cx::complex<double> c = g.julia ? seed : pix;
-            cx::complex<double> z = g.julia ? pix : cx::complex<double>(0, 0);
-            int it = 0;
-            double mag = 0.0;
-            try {
-                for (; it < maxit; ++it) {
-                    z = fractal_apply(z, c);
-                    mag = cx::norm_norm(z);
-                    if (mag > 256.0) break;
-                }
-            } catch (...) {
-                it = maxit;
-            }
-            size_t o = ((size_t)y * (size_t)w + (size_t)x) * 3;
-            if (it >= maxit) {
-                img[o] = 5;
-                img[o + 1] = 5;
-                img[o + 2] = 13;
-                continue;
-            }
-            float nu = (float)it + 1.0f - std::log(std::log((float)mag) * 0.5f) / std::log(2.0f);
-            float t = nu / (float)maxit;
-            float R = 0.5f + 0.5f * std::cos(0.15f * nu);
-            float Gch = 0.5f + 0.5f * std::cos(0.15f * nu + 2.1f);
-            float B = 0.5f + 0.5f * std::cos(0.15f * nu + 4.2f);
-            float s = 0.35f + 0.65f * t;
-            img[o] = (unsigned char)std::clamp(R * s * 255.0f, 0.f, 255.f);
-            img[o + 1] = (unsigned char)std::clamp(Gch * s * 255.0f, 0.f, 255.f);
-            img[o + 2] = (unsigned char)std::clamp(B * s * 255.0f, 0.f, 255.f);
+            size_t i = (size_t)y * (size_t)w + (size_t)x;
+            int k = it[i];
+            if (k < 0) k = maxit;
+            paint_orbit(img.data(), w, x, y, k, maxit, mag[i]);
         }
     }
     glBindTexture(GL_TEXTURE_2D, g.color);
@@ -773,7 +944,7 @@ static void ui_controls_body() {
     ImGui::TextUnformatted("Presets:");
     ui_preset_buttons();
     if (g.mode == Mode::Fractal) {
-        ImGui::TextWrapped("Iterate via scomplex M/T/B on this f. If the formula contains c, it is the full iterator (L is ignored). z^2 uses the GPU; other formulas use OpenMP.");
+        ImGui::TextWrapped("Iterate via M/T/B on this f. If the formula contains c, it is the full iterator (L is ignored). Ordinary complex runs on the GPU; split, dual, and gamma stay on the CPU.");
     }
 
     if (g.mode == Mode::Function) {
@@ -802,10 +973,15 @@ static void ui_controls_body() {
         if (ImGui::InputDouble("Julia Im", &g.julia_im, 0.0, 0.0, "%.12f")) g.view_dirty = true;
         if (ImGui::SliderInt("iterations", &g.max_iter, 32, 2000)) g.view_dirty = true;
         ImGui::TextUnformatted("Wheel: zoom at cursor. Drag: pan. Right-click: Julia seed.");
-        if (fractal_use_gpu())
-            ImGui::TextUnformatted("Renderer: GPU (z^2).");
+        if (fractal_use_gpu()) {
+            ImGui::TextUnformatted("Renderer: GPU.");
+            if (expr_uses_transcendental(g_fx))
+                ImGui::TextWrapped("exp / log / sin in this shader are float.");
+        }
+        else if (g.system == -1.0)
+            ImGui::TextUnformatted("Renderer: CPU (gamma or no GPU shader), quadtree interior.");
         else
-            ImGui::TextUnformatted("Renderer: CPU OpenMP + scomplex.");
+            ImGui::TextUnformatted("Renderer: CPU OpenMP + scomplex, quadtree interior.");
         if (!g.fractal_double)
             ImGui::TextWrapped("GPU has no double; zoom uses float (about 1e-6).");
     }
