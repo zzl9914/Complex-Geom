@@ -36,6 +36,9 @@ struct App {
     double scale = 4.5;
     int max_iter = 256;
     int family = 0; // 0 M, 1 T, 2 B
+    int mix = 0;    // 0 none, 1 add, 2 iterate
+    float mix_w[3] = { 1.f, 0.f, 0.f };
+    int mix_n[3] = { 1, 1, 1 };
     bool L = false;
     bool julia = false;
     double julia_re = -0.8, julia_im = 0.156;
@@ -329,7 +332,20 @@ static std::string fractal_shader_source(const CompiledExpr& e, bool dbl) {
     }
     o << "uniform vec2 u_resolution;\nuniform int u_family;\nuniform int u_L;\n";
     o << "uniform int u_max_iter;\nuniform int u_julia;\n";
+    o << "uniform int u_mix;\nuniform float u_wM;\nuniform float u_wT;\nuniform float u_wB;\n";
+    o << "uniform int u_nM;\nuniform int u_nT;\nuniform int u_nB;\n";
+    o << "uniform float u_bail;\n";
     o << body;
+    const char* T = dbl ? "dvec2" : "vec2";
+    o << T << " fam_step(" << T << " z0," << T << " c,int fam){\n";
+    o << "  " << T << " a=z0;\n";
+    o << "  if(fam==1) a=" << T << "(a.x,-a.y);\n";
+    o << "  if(fam==2) a=" << T << "(abs(a.x),abs(a.y));\n";
+    o << "  " << T << " f=cf_f(a,c);\n";
+    if (e.uses_c)
+        o << "  return f;\n}\n";
+    else
+        o << "  if(u_L!=0) return a-f+c;\n  return f+c;\n}\n";
     if (dbl) {
         o << R"(
 void main(){
@@ -341,10 +357,8 @@ void main(){
     dvec2 z = (u_julia != 0) ? pix : dvec2(0.0);
     int i;
     double mag = 0.0;
+    double bail = double(u_bail);
     for(i=0;i<u_max_iter;++i){
-        if(u_family==1) z = dvec2(z.x, -z.y);
-        if(u_family==2) z = dvec2(abs(z.x), abs(z.y));
-        dvec2 f = cf_f(z, c);
 )";
     } else {
         o << R"(
@@ -357,22 +371,49 @@ void main(){
     vec2 z = (u_julia != 0) ? pix : vec2(0.0);
     int i;
     float mag = 0.0;
+    float bail = u_bail;
     for(i=0;i<u_max_iter;++i){
-        if(u_family==1) z = vec2(z.x, -z.y);
-        if(u_family==2) z = vec2(abs(z.x), abs(z.y));
-        vec2 f = cf_f(z, c);
 )";
     }
+    o << "        if(u_mix==0){\n";
+    o << "            " << T << " a=z;\n";
+    o << "            if(u_family==1) a=" << T << "(a.x,-a.y);\n";
+    o << "            if(u_family==2) a=" << T << "(abs(a.x),abs(a.y));\n";
+    o << "            " << T << " f=cf_f(a,c);\n";
     if (e.uses_c)
-        o << "        z = f;\n";
+        o << "            z=f;\n";
     else
-        o << "        z = (u_L != 0) ? (z - f + c) : (f + c);\n";
+        o << "            z=(u_L!=0)?(a-f+c):(f+c);\n";
+    const char* W = dbl ? "double" : "float";
+    o << "        } else if(u_mix==1){\n";
+    o << "            " << T << " acc=" << T << "(" << (dbl ? "0.0lf" : "0.0") << ");\n";
+    o << "            " << W << " s=" << W << "(u_wM+u_wT+u_wB);\n";
+    o << "            if(s>" << W << "(0.0)){\n";
+    o << "                if(u_wM!=0.0) acc+=fam_step(z,c,0)*" << W << "(u_wM);\n";
+    o << "                if(u_wT!=0.0) acc+=fam_step(z,c,1)*" << W << "(u_wT);\n";
+    o << "                if(u_wB!=0.0) acc+=fam_step(z,c,2)*" << W << "(u_wB);\n";
+    o << "                z=acc/s;\n";
+    o << "            }\n";
+    o << "        } else {\n";
+    o << "            int cyc=u_nM+u_nT+u_nB;\n";
+    o << "            int fam=0;\n";
+    o << "            if(cyc>0){\n";
+    o << "                int r=i- (i/cyc)*cyc;\n";
+    o << "                if(r<u_nM) fam=0;\n";
+    o << "                else if(r<u_nM+u_nT) fam=1;\n";
+    o << "                else fam=2;\n";
+    o << "            }\n";
+    o << "            z=fam_step(z,c,fam);\n";
+    o << "        }\n";
     o << R"(
         mag = z.x*z.x + z.y*z.y;
-        if(!(mag <= 256.0)) break;
+        if(isnan(float(mag)) || isinf(float(mag)) || !(mag <= bail)) break;
     }
     if(i>=u_max_iter){ frag = vec4(0.02,0.02,0.05,1); return; }
-    float nu = float(i) + 1.0 - log(log(float(mag))*0.5)/log(2.0);
+    float mf = float(mag);
+    if(!(mf > 1.01)) mf = 2.0;
+    float nu = float(i) + 1.0 - log(log(mf)*0.5)/log(2.0);
+    if(isnan(nu) || isinf(nu)) nu = float(i);
     float t = nu / float(max(u_max_iter,1));
     vec3 col = vec3(0.5+0.5*cos(0.15*nu+0.0), 0.5+0.5*cos(0.15*nu+2.1), 0.5+0.5*cos(0.15*nu+4.2));
     frag = vec4(col*(0.35+0.65*t), 1.0);
@@ -416,12 +457,39 @@ static bool fractal_use_gpu() {
     return true;
 }
 
-static cx::complex<double> fractal_apply(cx::complex<double> a, cx::complex<double> c) {
-    if (g.family == 1) a = cx::conj(a);
-    else if (g.family == 2) a = cx::abs(a);
+static cx::complex<double> family_step(cx::complex<double> z, cx::complex<double> c, int fam) {
+    cx::complex<double> a = z;
+    if (fam == 1) a = cx::conj(a);
+    else if (fam == 2) a = cx::abs(a);
     auto fa = eval_f_raw(a, c);
     if (g_fx.uses_c) return fa;
     return g.L ? (a - fa + c) : (fa + c);
+}
+
+static int iter_family(int it) {
+    int nM = std::max(0, g.mix_n[0]);
+    int nT = std::max(0, g.mix_n[1]);
+    int nB = std::max(0, g.mix_n[2]);
+    int cyc = nM + nT + nB;
+    if (cyc <= 0) return 0;
+    int r = it % cyc;
+    if (r < nM) return 0;
+    if (r < nM + nT) return 1;
+    return 2;
+}
+
+static cx::complex<double> fractal_apply(cx::complex<double> z, cx::complex<double> c, int it) {
+    if (g.mix == 0) return family_step(z, c, g.family);
+    if (g.mix == 1) {
+        double s = (double)g.mix_w[0] + (double)g.mix_w[1] + (double)g.mix_w[2];
+        if (!(s > 0.0)) return z;
+        cx::complex<double> acc(0.0, 0.0);
+        if (g.mix_w[0] != 0.f) acc += family_step(z, c, 0) * (double)g.mix_w[0];
+        if (g.mix_w[1] != 0.f) acc += family_step(z, c, 1) * (double)g.mix_w[1];
+        if (g.mix_w[2] != 0.f) acc += family_step(z, c, 2) * (double)g.mix_w[2];
+        return acc / s;
+    }
+    return family_step(z, c, iter_family(it));
 }
 
 static cx::complex<double> from_pixel(double px, double py, double w, double h) {
@@ -445,6 +513,22 @@ static void hsv_rgb(double h, double s, double v, float& r, float& gch, float& b
     else if (i == 4) { rp = x; bp = c; }
     else { rp = c; bp = x; }
     r = (float)(rp + m); gch = (float)(gp + m); b = (float)(bp + m);
+}
+
+// Fullscreen is many times more pixels than the 1600x900 window, and the
+// client size often jitters by a pixel. Either one makes every frame rebuild
+// and redraw the fractal until the window stops responding.
+static void plane_target(int aw, int ah, int& w, int& h) {
+    aw = std::max(1, aw);
+    ah = std::max(1, ah);
+    int long_side = std::max(aw, ah);
+    int bucket = std::max(64, ((long_side + 32) / 64) * 64);
+    double s = (double)bucket / (double)long_side;
+    const double max_area = 1600.0 * 900.0;
+    double area = (double)aw * (double)ah * s * s;
+    if (area > max_area) s *= std::sqrt(max_area / area);
+    w = std::max(1, (int)std::lround(aw * s));
+    h = std::max(1, (int)std::lround(ah * s));
 }
 
 static void ensure_fbo(int w, int h) {
@@ -652,6 +736,8 @@ static void render_domain_cpu() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data());
 }
 
+static double power_bail_mag(const CompiledExpr& e);
+
 static int iterate_orbit(cx::complex<double> pix, cx::complex<double> seed, int maxit, double& mag) {
     cx::complex<double> c = g.julia ? seed : pix;
     cx::complex<double> z = g.julia ? pix : cx::complex<double>(0, 0);
@@ -659,9 +745,10 @@ static int iterate_orbit(cx::complex<double> pix, cx::complex<double> seed, int 
     mag = 0.0;
     try {
         for (; it < maxit; ++it) {
-            z = fractal_apply(z, c);
+            z = fractal_apply(z, c, it);
             mag = cx::norm_norm(z);
-            if (!(mag <= 256.0)) break;
+            double bail = refresh_compiled() ? power_bail_mag(g_fx) : 256.0;
+            if (!std::isfinite(mag) || mag > bail) break;
         }
     } catch (...) {
         it = maxit;
@@ -778,6 +865,41 @@ static void render_fractal_cpu() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, img.data());
 }
 
+static double power_bail_mag(const CompiledExpr& e) {
+    if (e.root < 0) return 256.0;
+    const AstNode& r = e.n[(size_t)e.root];
+    int bi = -1, ei = -1;
+    if (r.kind == AstNode::Pow) { bi = r.a; ei = r.b; }
+    else if (r.kind == AstNode::Call && (ExprFn)r.fn == ExprFn::Pow) { bi = r.a; ei = r.b; }
+    else return 256.0;
+    if (bi < 0 || ei < 0) return 256.0;
+    const AstNode& base = e.n[(size_t)bi];
+    const AstNode& ex = e.n[(size_t)ei];
+    if (base.kind != AstNode::Z || ex.kind != AstNode::Const) return 256.0;
+    if (ex.im == 0.0 && std::abs(ex.re - std::round(ex.re)) < 1e-9 && std::abs(ex.re) <= 16.0)
+        return 256.0;
+    double mod = std::sqrt(ex.re * ex.re + ex.im * ex.im);
+    if (!(mod > 1.05)) return 256.0;
+    double sqR = std::pow(4e5, 1.0 / (mod - 1.0));
+    if (!std::isfinite(sqR) || sqR < 256.0) return 256.0;
+    if (sqR > 1e20) sqR = 1e20;
+    return sqR;
+}
+
+static double min_useful_scale() {
+    double cabs = std::max(std::abs(g.center_x), std::abs(g.center_y));
+    if (cabs < 1.0) cabs = 1.0;
+    bool coarse = !g.fractal_double;
+    if (g.mode == Mode::Fractal && g.system == -1.0 && refresh_compiled())
+        coarse = coarse || expr_uses_transcendental(g_fx) || g.mix != 0;
+    else if (g.mode != Mode::Fractal)
+        coarse = true;
+    double eps = coarse ? 1.19209290e-7 : 2.220446049250313e-16;
+    double pix = 64.0;
+    if (g.fbo_w > 1 && g.fbo_h > 1) pix = (double)std::min(g.fbo_w, g.fbo_h);
+    return eps * cabs * pix;
+}
+
 static void set_fractal_uniforms() {
     glUseProgram(g.prog_fractal);
     if (g.fractal_double && glUniform2d && glUniform1d) {
@@ -794,12 +916,20 @@ static void set_fractal_uniforms() {
     glUniform1i(glGetUniformLocation(g.prog_fractal, "u_L"), g.L ? 1 : 0);
     glUniform1i(glGetUniformLocation(g.prog_fractal, "u_max_iter"), g.max_iter);
     glUniform1i(glGetUniformLocation(g.prog_fractal, "u_julia"), g.julia ? 1 : 0);
+    glUniform1i(glGetUniformLocation(g.prog_fractal, "u_mix"), g.mix);
+    glUniform1f(glGetUniformLocation(g.prog_fractal, "u_wM"), g.mix_w[0]);
+    glUniform1f(glGetUniformLocation(g.prog_fractal, "u_wT"), g.mix_w[1]);
+    glUniform1f(glGetUniformLocation(g.prog_fractal, "u_wB"), g.mix_w[2]);
+    glUniform1i(glGetUniformLocation(g.prog_fractal, "u_nM"), std::max(0, g.mix_n[0]));
+    glUniform1i(glGetUniformLocation(g.prog_fractal, "u_nT"), std::max(0, g.mix_n[1]));
+    glUniform1i(glGetUniformLocation(g.prog_fractal, "u_nB"), std::max(0, g.mix_n[2]));
+    float bail = 256.f;
+    if (refresh_compiled()) bail = (float)power_bail_mag(g_fx);
+    glUniform1f(glGetUniformLocation(g.prog_fractal, "u_bail"), bail);
 }
 
 static void render_view() {
-    bool gpu = (g.mode == Mode::Fractal && fractal_use_gpu()) ||
-               (g.mode == Mode::Function && g.fn_view == FnView::Domain && g.system == -1.0 && gpu_fn_id() >= 0);
-    if (!gpu && !g.view_dirty) return;
+    if (!g.view_dirty) return;
     glBindFramebuffer(GL_FRAMEBUFFER, g.fbo);
     glViewport(0, 0, g.fbo_w, g.fbo_h);
     glDisable(GL_DEPTH_TEST);
@@ -835,11 +965,14 @@ static void render_view() {
 
 static void draw_overlay(ImVec2 origin, ImVec2 size) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    double m = std::min(size.x, size.y);
+    double fw = std::max(1, g.fbo_w), fh = std::max(1, g.fbo_h);
+    double fm = std::min(fw, fh);
     auto to_screen = [&](double re, double im) {
+        double px = fw * 0.5 + (re - g.center_x) / g.scale * fm;
+        double py = fh * 0.5 + (im - g.center_y) / g.scale * fm;
         return ImVec2(
-            (float)(origin.x + size.x * 0.5 + (re - g.center_x) / g.scale * m),
-            (float)(origin.y + size.y * 0.5 - (im - g.center_y) / g.scale * m));
+            (float)(origin.x + px / fw * size.x),
+            (float)(origin.y + size.y - py / fh * size.y));
     };
     if (g.show_grid) {
         double step = std::pow(10.0, std::floor(std::log10(g.scale / 4.0)));
@@ -936,8 +1069,8 @@ static void ui_controls_body() {
         g.view_dirty = true;
     }
     ImGui::Text("scale = %.3e", g.scale);
-    if (g.scale < 1e-13)
-        ImGui::TextWrapped("Double precision is exhausted; zoom out or the picture will pixelate.");
+    if (g.mode == Mode::Fractal && g.scale <= min_useful_scale() * 1.0000001)
+        ImGui::TextWrapped("Zoom limit. Further zoom-in does nothing.");
 
     ImGui::SeparatorText("Formula f(z)");
     if (ImGui::InputText("f(z)", g.expr, sizeof(g.expr))) g.view_dirty = true;
@@ -961,9 +1094,27 @@ static void ui_controls_body() {
         }
     } else {
         ImGui::SeparatorText("M / T / B  (scomplex)");
-        if (ImGui::RadioButton("M  f then +c", g.family == 0)) { g.family = 0; g.view_dirty = true; }
-        if (ImGui::RadioButton("T  conj then M", g.family == 1)) { g.family = 1; g.view_dirty = true; }
-        if (ImGui::RadioButton("B  abs then M", g.family == 2)) { g.family = 2; g.view_dirty = true; }
+        if (ImGui::RadioButton("M  f then +c", g.mix == 0 && g.family == 0)) { g.mix = 0; g.family = 0; g.view_dirty = true; }
+        if (ImGui::RadioButton("T  conj then M", g.mix == 0 && g.family == 1)) { g.mix = 0; g.family = 1; g.view_dirty = true; }
+        if (ImGui::RadioButton("B  abs then M", g.mix == 0 && g.family == 2)) { g.mix = 0; g.family = 2; g.view_dirty = true; }
+        if (ImGui::RadioButton("Add mix", g.mix == 1)) {
+            if (g.mix != 1 && g.mix_w[1] == 0.f && g.mix_w[2] == 0.f)
+                g.mix_w[0] = g.mix_w[1] = g.mix_w[2] = 1.f;
+            g.mix = 1;
+            g.view_dirty = true;
+        }
+        if (ImGui::RadioButton("Iterate mix", g.mix == 2)) { g.mix = 2; g.view_dirty = true; }
+        if (g.mix == 1) {
+            ImGui::TextUnformatted("Add: normalized wM*M + wT*T + wB*B.");
+            if (ImGui::SliderFloat("M weight", &g.mix_w[0], 0.f, 1.f)) g.view_dirty = true;
+            if (ImGui::SliderFloat("T weight", &g.mix_w[1], 0.f, 1.f)) g.view_dirty = true;
+            if (ImGui::SliderFloat("B weight", &g.mix_w[2], 0.f, 1.f)) g.view_dirty = true;
+        } else if (g.mix == 2) {
+            ImGui::TextUnformatted("Iterate: repeat M, then T, then B, by these counts.");
+            if (ImGui::SliderInt("M count", &g.mix_n[0], 0, 16)) g.view_dirty = true;
+            if (ImGui::SliderInt("T count", &g.mix_n[1], 0, 16)) g.view_dirty = true;
+            if (ImGui::SliderInt("B count", &g.mix_n[2], 0, 16)) g.view_dirty = true;
+        }
         refresh_compiled();
         if (g_fx.uses_c)
             ImGui::TextDisabled("L ignored: formula already contains c");
@@ -973,11 +1124,8 @@ static void ui_controls_body() {
         if (ImGui::InputDouble("Julia Im", &g.julia_im, 0.0, 0.0, "%.12f")) g.view_dirty = true;
         if (ImGui::SliderInt("iterations", &g.max_iter, 32, 2000)) g.view_dirty = true;
         ImGui::TextUnformatted("Wheel: zoom at cursor. Drag: pan. Right-click: Julia seed.");
-        if (fractal_use_gpu()) {
+        if (fractal_use_gpu())
             ImGui::TextUnformatted("Renderer: GPU.");
-            if (expr_uses_transcendental(g_fx))
-                ImGui::TextWrapped("exp / log / sin in this shader are float.");
-        }
         else if (g.system == -1.0)
             ImGui::TextUnformatted("Renderer: CPU (gamma or no GPU shader), quadtree interior.");
         else
@@ -1065,7 +1213,9 @@ static void ui_plane_screen() {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x < 16) avail.x = 16;
     if (avail.y < 16) avail.y = 16;
-    ensure_fbo((int)avail.x, (int)avail.y);
+    int tw = 1, th = 1;
+    plane_target((int)avail.x, (int)avail.y, tw, th);
+    ensure_fbo(tw, th);
     render_view();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     ImGui::Image(ImTextureRef((ImTextureID)(ImU64)g.color), avail, ImVec2(0, 1), ImVec2(1, 0));
@@ -1074,21 +1224,33 @@ static void ui_plane_screen() {
     if (hovered) {
         double mx = io.MousePos.x - origin.x;
         double my = avail.y - (io.MousePos.y - origin.y);
-        auto z = from_pixel(mx, my, avail.x, avail.y);
+        double fw = std::max(1, g.fbo_w), fh = std::max(1, g.fbo_h);
+        double px = (mx / avail.x) * fw;
+        double py = (my / avail.y) * fh;
+        auto z = from_pixel(px, py, fw, fh);
         g.probe_x = cx::real(z);
         g.probe_y = cx::imag(z);
         g.has_probe = true;
         if (io.MouseWheel != 0 && !io.KeyCtrl) {
             double factor = std::pow(1.12, -io.MouseWheel);
-            g.center_x = z.real() + (g.center_x - z.real()) * factor;
-            g.center_y = z.imag() + (g.center_y - z.imag()) * factor;
-            g.scale *= factor;
-            g.view_dirty = true;
+            bool zoom_in = factor < 1.0;
+            double floor_s = min_useful_scale();
+            if (zoom_in && g.scale <= floor_s * 1.0000001) {
+                // Already at the precision limit: further zoom is a no-op.
+            } else {
+                if (zoom_in && g.scale * factor < floor_s)
+                    factor = floor_s / g.scale;
+                g.center_x = z.real() + (g.center_x - z.real()) * factor;
+                g.center_y = z.imag() + (g.center_y - z.imag()) * factor;
+                g.scale *= factor;
+                if (!std::isfinite(g.scale) || g.scale < floor_s) g.scale = floor_s;
+                g.view_dirty = true;
+            }
         }
         if (ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            double m = std::min(avail.x, avail.y);
-            g.center_x -= io.MouseDelta.x / m * g.scale;
-            g.center_y += io.MouseDelta.y / m * g.scale;
+            double fm = std::min(fw, fh);
+            g.center_x -= (io.MouseDelta.x / avail.x) * fw / fm * g.scale;
+            g.center_y += (io.MouseDelta.y / avail.y) * fh / fm * g.scale;
             g.view_dirty = true;
         }
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {

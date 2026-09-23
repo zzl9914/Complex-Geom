@@ -73,7 +73,10 @@ inline Z zsqrt(Z a) {
 inline Z zpow(Z a, Z b) {
     if (b.re == 0.0 && b.im == 0.0) return { 1.0, 0.0 };
     if (a.re == 0.0 && a.im == 0.0) {
-        if (b.im == 0.0 && b.re > 0.0) return { 0.0, 0.0 };
+        // 0^(a+bi) = 0 whenever a > 0, including a complex exponent.
+        // Treating only pure-real exponents as 0 made 0^(2+i) a pole, so every
+        // Mandelbrot orbit exploded on the first step.
+        if (b.re > 0.0) return { 0.0, 0.0 };
         throw ExprError("zero to a non-positive power");
     }
     if (b.im == 0.0) {
@@ -177,6 +180,7 @@ inline cx::complex<double> eval(const CompiledExpr& e, cx::complex<double> z0, c
     Z w = go(go, e.root);
     return cx::complex<double>(fin(w.re), fin(w.im));
 }
+
 } // namespace ordinary
 
 inline cx::complex<double> eval_compiled(const CompiledExpr& e, cx::complex<double> z,
@@ -490,12 +494,9 @@ inline std::string glsl_formula(const CompiledExpr& e, bool dbl) {
         return std::string(T) + "(" + num(re) + "," + num(im) + ")";
     };
     std::ostringstream o;
-    // Desktop GLSL 400 has float exp/log/sin, not double. Transcendentals go
-    // through float; adds and multiplies stay in the shader's own type, so
-    // z^2 can still iterate in double.
-    auto widen = [&](const std::string& floatExpr) {
-        return dbl ? "double(" + floatExpr + ")" : floatExpr;
-    };
+    // Hardware float exp/log/sin. A double Taylor series here runs inside
+    // every pixel and every iteration, and SwapBuffers waits for it, so the
+    // window stops responding. 0^(a+bi) is 0 when a > 0.
     o << "float sinh_r(float x){ return (exp(x)-exp(-x))*0.5; }\n";
     o << "float cosh_r(float x){ return (exp(x)+exp(-x))*0.5; }\n";
     o << T << " cmul(" << T << " a," << T << " b){ return " << T << "(a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x); }\n";
@@ -504,37 +505,41 @@ inline std::string glsl_formula(const CompiledExpr& e, bool dbl) {
     o << "  if(!(d>" << num(0) << ")) return " << C(1e20, 0) << ";\n";
     o << "  return " << T << "(a.x*b.x+a.y*b.y, a.y*b.x-a.x*b.y)/d;\n}\n";
     o << T << " cexp(" << T << " a){ float y=float(a.y); float e=exp(float(a.x)); return "
-      << T << "(" << widen("e*cos(y)") << "," << widen("e*sin(y)") << "); }\n";
+      << T << "(" << (dbl ? "double(e*cos(y)), double(e*sin(y))" : "e*cos(y), e*sin(y)") << "); }\n";
     o << T << " clog(" << T << " a){\n";
     o << "  float n2=float(a.x)*float(a.x)+float(a.y)*float(a.y);\n";
     o << "  if(!(n2>0.0)) return " << C(-1e8, 0) << ";\n";
-    o << "  return " << T << "(" << widen("0.5*log(n2)") << "," << widen("atan(float(a.y),float(a.x))") << ");\n}\n";
+    if (dbl) {
+        o << "  return " << T << "(double(0.5*log(n2)), double(atan(float(a.y),float(a.x))));\n}\n";
+    } else {
+        o << "  return " << T << "(0.5*log(n2), atan(a.y,a.x));\n}\n";
+    }
     o << T << " cpow(" << T << " a," << T << " b){\n";
     o << "  if(b.x==" << num(0) << " && b.y==" << num(0) << ") return " << C(1, 0) << ";\n";
     o << "  " << S << " aa=a.x*a.x+a.y*a.y;\n";
     o << "  if(!(aa>" << num(0) << ")){\n";
-    o << "    if(b.y==" << num(0) << " && b.x>" << num(0) << ") return " << C(0, 0) << ";\n";
+    o << "    if(b.x>" << num(0) << ") return " << C(0, 0) << ";\n";
     o << "    return " << C(1e20, 0) << ";\n  }\n";
     o << "  return cexp(cmul(clog(a), b));\n}\n";
     o << T << " csqrt(" << T << " a){\n";
     o << "  if(a.y==" << num(0) << " && a.x>=" << num(0) << ") return " << T << "("
-      << widen("sqrt(float(a.x))") << "," << num(0) << ");\n";
+      << (dbl ? "double(sqrt(float(a.x)))" : "sqrt(a.x)") << "," << num(0) << ");\n";
     o << "  return cpow(a," << C(0.5, 0) << ");\n}\n";
     o << T << " csin(" << T << " a){ float x=float(a.x), y=float(a.y); return " << T << "("
-      << widen("sin(x)*cosh_r(y)") << "," << widen("cos(x)*sinh_r(y)") << "); }\n";
+      << (dbl ? "double(sin(x)*cosh_r(y)), double(cos(x)*sinh_r(y))" : "sin(x)*cosh_r(y), cos(x)*sinh_r(y)") << "); }\n";
     o << T << " ccos(" << T << " a){ float x=float(a.x), y=float(a.y); return " << T << "("
-      << widen("cos(x)*cosh_r(y)") << "," << widen("-sin(x)*sinh_r(y)") << "); }\n";
+      << (dbl ? "double(cos(x)*cosh_r(y)), double(-sin(x)*sinh_r(y))" : "cos(x)*cosh_r(y), -sin(x)*sinh_r(y)") << "); }\n";
     o << T << " csinh(" << T << " a){ float x=float(a.x), y=float(a.y); return " << T << "("
-      << widen("sinh_r(x)*cos(y)") << "," << widen("cosh_r(x)*sin(y)") << "); }\n";
+      << (dbl ? "double(sinh_r(x)*cos(y)), double(cosh_r(x)*sin(y))" : "sinh_r(x)*cos(y), cosh_r(x)*sin(y)") << "); }\n";
     o << T << " ccosh(" << T << " a){ float x=float(a.x), y=float(a.y); return " << T << "("
-      << widen("cosh_r(x)*cos(y)") << "," << widen("sinh_r(x)*sin(y)") << "); }\n";
+      << (dbl ? "double(cosh_r(x)*cos(y)), double(sinh_r(x)*sin(y))" : "cosh_r(x)*cos(y), sinh_r(x)*sin(y)") << "); }\n";
     o << T << " casin(" << T << " a){\n";
     o << "  " << T << " w=clog(cmul(" << C(0, 1) << ",a)+csqrt(" << C(1, 0) << "-cmul(a,a)));\n";
     o << "  return " << T << "(w.y,-w.x);\n}\n";
     o << T << " cacos(" << T << " a){ return " << C(1.5707963267948966, 0) << "-casin(a); }\n";
     o << T << " catan(" << T << " a){\n";
     o << "  " << T << " w=clog(cdiv(" << C(0, 1) << "+a," << C(0, 1) << "-a));\n";
-    o << "  return " << T << "(" << widen("0.5*float(w.y)") << "," << widen("-0.5*float(w.x)") << ");\n}\n";
+    o << "  return " << T << "(" << (dbl ? "0.5lf*w.y" : "0.5*w.y") << "," << (dbl ? "-0.5lf*w.x" : "-0.5*w.x") << ");\n}\n";
     o << T << " casinh(" << T << " a){ return clog(a+csqrt(cmul(a,a)+" << C(1, 0) << ")); }\n";
     o << T << " cacosh(" << T << " a){ return clog(a+csqrt(cmul(a,a)-" << C(1, 0) << ")); }\n";
     o << T << " catanh(" << T << " a){ return cmul(" << C(0.5, 0) << ",clog(cdiv(" << C(1, 0) << "+a," << C(1, 0) << "-a))); }\n";
